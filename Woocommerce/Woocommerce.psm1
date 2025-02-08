@@ -157,17 +157,28 @@ function Invoke-WooCommerceAPICall {
 
 		if ($result) {
 			# loop trough all following pages and add to result if available
-			if ($responseHeaders.'X-WP-TotalPages') {
+			if (($responseHeaders.'X-WP-TotalPages') -and ($url -notlike '*page=*')) {
+				Write-Debug -Message "Link: $($responseHeaders.link)"
+
 				Write-Debug -Message "Total#: $($responseHeaders.'X-WP-Total')"
 				Write-Debug -Message "TotalPages: $($responseHeaders.'X-WP-TotalPages')"
 				$i = 2
 				while ($i -le [int]($responseHeaders.'X-WP-TotalPages'[0])) {
 					Write-Debug -Message "GET $($url)?page=$i"
-					$invokeParams.Uri = "$($url)?page=$i"
+					if ($url -like '*?*') {
+						$invokeParams.Uri = "$url&page=$i"
+					}
+					else {
+						$invokeParams.Uri = "$url?page=$i"
+					}
 					$result += Invoke-RestMethod @invokeParams
 					$i++
 				}
-			}		
+			}
+			if ($responseHeaders.'X-WP-Total' -and ($result.count -ne [int]($responseHeaders.'X-WP-Total' | Out-String))) {
+				Write-Warning -Message "Not all $($responseHeaders.'X-WP-Total') items could be retrieved. Count: $($result.count) (maybe a filter is set)"
+				Wait-Debugger
+			}
 			return $result
 		}
 		else {
@@ -176,7 +187,8 @@ function Invoke-WooCommerceAPICall {
 	}
 	catch {
 		$errorMessage = $_.Exception.Message
-		Write-Error -Message "Error while calling the WooCommerce API with url $($url):`n $errorMessage" -Category InvalidOperation
+		Write-Error -Message "Error while calling the WooCommerce API:`n $errorMessage" -Category InvalidOperation
+		Wait-Debugger
 		return $null
 	}
 }
@@ -224,7 +236,9 @@ function Get-WooCommerceOrder {
 		$order = 'asc',
 		[Parameter(HelpMessage = "Sort collection by object attribute. Options: id, include, title, slug, date. Default is date.")]
 		[ValidateSet('id', 'include', 'title', 'slug', 'date')]
-		$orderby = 'date'		
+		$orderby = 'date',
+		[Parameter(HelpMessage = "Limit result set to orders assigned a specific product.")]
+		[int]$product
 	)
 	
 	if (Get-WooCommerceCredential) {
@@ -241,6 +255,9 @@ function Get-WooCommerceOrder {
 			if ($after) {
 				$after_date = Get-Date $after -Format "yyyy-MM-ddTHH:mm:ss"
 				$url += "&after=$after_date"
+			}
+			if ($product) {
+				$url += "&product=$product"
 			}
 		}
 		if ($addquery) {
@@ -492,10 +509,8 @@ function Get-WooCommerceProduct {
 	(
 		[Parameter(Position = 1)]
 		[ValidateNotNullOrEmpty()]
-		[System.String]$id,
-		[Parameter(Position = 2)]
-		[switch]$all,
-		[Parameter(Position = 3)]
+		$id,
+		[Parameter()]
 		[string]$addquery,
 		[Parameter(HelpMessage = "Sort products ascending or descending. Options: asc, desc. Default is asc.")]
 		[ValidateSet('asc', 'desc')]
@@ -513,12 +528,27 @@ function Get-WooCommerceProduct {
 		[ValidateSet('instock', 'outofstock', 'onbackorder')]
 		$stockstatus = 'instock',
 		[Parameter(HelpMessage = "Limit result set to products on sale.")]
-		$on_sale
+		$on_sale,
+		[Parameter(HelpMessage = "Limit result set to products with a specific tax class. Options: reduced-rate, zero-rate, standard. Default is standard.")]
+		[ValidateSet('reduced-rate', 'zero-rate', 'standard')]
+		$tax_class = 'standard',
+		[Parameter(HelpMessage = "Limit result set to specific ids.")]
+		$include,
+		[Parameter(HelpMessage = "Limit result set to products assigned a specific type. Options: simple, grouped, external and variable.")]
+		[ValidateSet("simple", "grouped", "external", "variable")]
+		$type
 	)
 	if (Get-WooCommerceCredential) {
 		$url = "/products"
-		if ($id -and !$all) {
-			$url += "/$id"
+		if ($id) {
+			if ($id -is [array]) {
+				$idList = $id -join ','
+				$url += "?include=$idList"
+				$url += "&orderby=$orderby&order=$order&stock_status=$stockstatus"
+			}
+			else {
+				$url += "/$id"
+			}
 		}
 		else {
 			$url += "?orderby=$orderby&order=$order&stock_status=$stockstatus"
@@ -536,6 +566,15 @@ function Get-WooCommerceProduct {
 			}
 			if ($on_sale) {
 				$url += "&on_sale=$on_sale"
+			}
+			if ($tax_class -ne 'standard') {
+				$url += "&tax_class=$tax_class"
+			}
+			if ($include) {
+				$url += "&include=$include"
+			}
+			if ($type) {
+				$url += "&type=$type"
 			}
 		}
 		Write-Debug -Message "GET $url"
@@ -752,6 +791,40 @@ function Remove-WooCommerceProductReview {
 		Return $null
 	}
 }
+
+function Set-WooCommerceProductReview {
+	[CmdletBinding(SupportsShouldProcess = $true)]
+	param
+	(
+		[Parameter(Mandatory = $true, Position = 1, HelpMessage = "The id of the product")]
+		[System.String]$product_id,
+		[ValidateNotNullOrEmpty()]
+		[System.String]$review,
+		[ValidateNotNullOrEmpty()]
+		[System.String]$reviewer,
+		[System.String]$reviewer_email,
+		[ValidateNotNullOrEmpty()]
+		[System.String]$rating,
+		[Parameter(HelpMessage = "The status of the review. Options: approved, hold, spam, unspam, trash, untrash. Default is approved.")]
+		[ValidateSet('approved', 'hold', 'spam', 'unspam', 'trash', 'untrash')]
+		[System.String]$status = 'approved'
+	)
+
+	$url = "/products/reviews"
+	$query = @{
+		product_id = $product_id
+		reviewer   = $reviewer
+		review     = $review
+		rating     = $rating
+		status     = $status
+	}
+	if ($reviewer_email) {
+		$query += @{ reviewer_email = $reviewer_email }
+	}
+
+	$json = $query | ConvertTo-Json
+	$result = Invoke-WooCommerceAPICall -RelativeUrl $url -Method "POST" -Body $json
+}
 #endregion Product
 
 #region Category
@@ -876,7 +949,8 @@ function Get-WooCommerceWebhook {
 		$url = "/webhooks"
 		if ($id) {
 			$url += "/$id"
-		} else {
+		}
+		else {
 			$url += "?status=$status"
 		}
 		if ($addquery) {
@@ -910,7 +984,7 @@ function Get-WooCommerceSetting {
 function Get-WooCommerceSettingOption {
 	param
 	(
-		[Parameter(Mandatory =$true, Position = 1)]
+		[Parameter(Mandatory = $true, Position = 1)]
 		[System.String]$group_id,
 		[Parameter(Mandatory = $true, Position = 2)]
 		$id
